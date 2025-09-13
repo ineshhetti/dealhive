@@ -1,0 +1,505 @@
+DEALHIVE MVP — CLAUDE CODE IMPLEMENTATION GUIDE (.txt)
+Author: ChatGPT (for Inesh) • Date: 2025-09-13
+Purpose: End-to-end instructions for Claude Code to scaffold, implement, test, and integrate the DealHive MVP
+Stack: Java 21 • Spring Boot 3.x • REST • PostgreSQL 16 • JPA/Hibernate • Flyway • Testcontainers • Docker • docker-compose • React (later)
+Repo Layout (proposed):
+  /backend
+    /src/main/java/com/dealhive/...
+    /src/main/resources
+      application.yml
+      db/migration/V1__init.sql
+    pom.xml
+  /ops
+    docker-compose.yml
+    Dockerfile.app
+    Dockerfile.pg (optional)
+    start_db.sh
+    stop_db.sh
+    seed.sql
+  /docs
+    DealHive-API.postman_collection.json
+  README.md
+
+───────────────────────────────────────────────────────────────────────────────
+1) HIGH-LEVEL MVP SCOPE
+───────────────────────────────────────────────────────────────────────────────
+Core flows:
+  - Users: register/login (MVP local JWT), view profile, see their posts/votes
+  - Deals: CRUD by owner, list, detail, vote up/down, hot/new/trending sort
+  - Comments: add, list, vote
+  - Search & filters: keyword, store, category, price, created_at
+  - Moderation: flag a deal/comment, simple admin endpoints
+
+Success metrics (MVP):
+  - p95 API < 300ms on list endpoints with 10k rows
+  - Zero-downtime DB migrations via Flyway
+  - Full local env via docker-compose (app+db) & quick start/stop scripts
+
+───────────────────────────────────────────────────────────────────────────────
+2) ARCHITECTURE & DATA MODEL
+───────────────────────────────────────────────────────────────────────────────
+Backend:
+  - Spring Boot 3.x (Web, Validation, Security, Data JPA)
+  - PostgreSQL 16 (dockerized), Flyway migrations
+  - JWT auth (io.jsonwebtoken or spring-security-oauth2-jose), password hashing (BCrypt)
+Testing:
+  - JUnit 5, Spring Boot Test, Testcontainers (Postgres)
+  - REST Assured for API tests
+
+ER Model (simplified):
+  users(id PK, email unique, password_hash, display_name, created_at)
+  stores(id PK, name unique, url)
+  categories(id PK, name unique, slug unique)
+  deals(id PK, user_id FK->users, store_id FK->stores, title, description, url, img_url,
+        price_cents, original_price_cents, category_id FK->categories, score_int, expires_at, created_at)
+  deal_tags(deal_id FK, tag varchar, PK(deal_id, tag))
+  comments(id PK, deal_id FK, user_id FK, body, score_int, created_at, parent_id nullable)
+  votes(id PK, user_id FK, target_type enum('DEAL','COMMENT'), target_id, value smallint {-1,1},
+        unique(user_id, target_type, target_id))
+  flags(id PK, user_id FK, target_type, target_id, reason, created_at)
+
+Indexes:
+  deals(title gin_trgm_ops), deals(created_at desc), deals(score_int desc), deals(category_id), deals(store_id)
+  comments(deal_id, created_at desc)
+  votes(target_type, target_id), unique on (user_id, target_type, target_id)
+
+───────────────────────────────────────────────────────────────────────────────
+3) POSTGRES IN DOCKER & QUICK SCRIPTS
+───────────────────────────────────────────────────────────────────────────────
+File: ops/docker-compose.yml
+---
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    container_name: dealhive-db
+    environment:
+      POSTGRES_USER: dealhive
+      POSTGRES_PASSWORD: dealhive
+      POSTGRES_DB: dealhive
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dealhive -d dealhive"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: ../
+      dockerfile: ops/Dockerfile.app
+    container_name: dealhive-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_URL: jdbc:postgresql://db:5432/dealhive
+      DB_USERNAME: dealhive
+      DB_PASSWORD: dealhive
+      JWT_SECRET: "replace_me_dev_only"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  db_data:
+---
+
+File: ops/Dockerfile.app
+---
+# syntax=docker/dockerfile:1
+FROM eclipse-temurin:21-jdk AS build
+WORKDIR /app
+COPY backend/pom.xml backend/pom.xml
+RUN --mount=type=cache,target=/root/.m2 mvn -f backend/pom.xml -q -e -DskipTests dependency:go-offline
+COPY backend/ backend/
+RUN --mount=type=cache,target=/root/.m2 mvn -f backend/pom.xml -q -e -DskipTests package
+
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY --from=build /app/backend/target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java","-jar","/app/app.jar"]
+---
+
+File: ops/seed.sql (optional initial data)
+---
+INSERT INTO categories (name, slug) VALUES
+  ('Electronics','electronics'),
+  ('Groceries','groceries'),
+  ('Fashion','fashion')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO stores (name, url) VALUES
+  ('Amazon','https://www.amazon.com'),
+  ('Walmart','https://www.walmart.com'),
+  ('Best Buy','https://www.bestbuy.com')
+ON CONFLICT DO NOTHING;
+---
+
+Quick scripts:
+File: ops/start_db.sh
+---
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+docker compose up -d db
+echo "Waiting for Postgres to be healthy..."
+until [ "$(docker inspect -f '{{.State.Health.Status}}' dealhive-db)" == "healthy" ]; do
+  sleep 1
+done
+echo "Postgres is ready at localhost:5432 (user=dealhive, pwd=dealhive, db=dealhive)."
+---
+
+File: ops/stop_db.sh
+---
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+docker compose stop db
+echo "Postgres stopped."
+---
+Make executable:
+  chmod +x ops/start_db.sh ops/stop_db.sh
+
+One-liners:
+  # Start full stack (app + db)
+  docker compose -f ops/docker-compose.yml up -d
+  # Stop all
+  docker compose -f ops/docker-compose.yml down
+
+───────────────────────────────────────────────────────────────────────────────
+4) SPRING BOOT CONFIG & MIGRATIONS
+───────────────────────────────────────────────────────────────────────────────
+File: backend/pom.xml (key deps)
+---
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-validation</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>runtime</scope>
+  </dependency>
+  <dependency>
+    <groupId>org.flywaydb</groupId>
+    <artifactId>flyway-core</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.11.5</version>
+  </dependency>
+  <dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+  </dependency>
+  <dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+  </dependency>
+  <!-- Tests -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-test</artifactId>
+    <scope>test</scope>
+  </dependency>
+  <dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>test</scope>
+  </dependency>
+  <dependency>
+    <groupId>io.rest-assured</groupId>
+    <artifactId>rest-assured</artifactId>
+    <version>5.4.0</version>
+    <scope>test</scope>
+  </dependency>
+</dependencies>
+---
+
+File: backend/src/main/resources/application.yml
+---
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/dealhive}
+    username: ${DB_USERNAME:dealhive}
+    password: ${DB_PASSWORD:dealhive}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+        format_sql: false
+        show_sql: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+server:
+  port: 8080
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:replace_me_dev_only}
+    ttlMinutes: 43200
+---
+
+File: backend/src/main/resources/db/migration/V1__init.sql (idempotent where safe)
+---
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE TABLE IF NOT EXISTS users (
+  id BIGSERIAL PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS stores(
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS categories(
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  slug TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS deals(
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  store_id BIGINT REFERENCES stores(id),
+  category_id BIGINT REFERENCES categories(id),
+  title TEXT NOT NULL,
+  description TEXT,
+  url TEXT,
+  img_url TEXT,
+  price_cents INT,
+  original_price_cents INT,
+  score_int INT NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS deals_created_idx ON deals(created_at DESC);
+CREATE INDEX IF NOT EXISTS deals_score_idx ON deals(score_int DESC);
+CREATE INDEX IF NOT EXISTS deals_title_trgm_idx ON deals USING GIN (title gin_trgm_ops);
+
+CREATE TABLE IF NOT EXISTS deal_tags(
+  deal_id BIGINT NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
+  tag TEXT NOT NULL,
+  PRIMARY KEY (deal_id, tag)
+);
+
+CREATE TABLE IF NOT EXISTS comments(
+  id BIGSERIAL PRIMARY KEY,
+  deal_id BIGINT NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  parent_id BIGINT REFERENCES comments(id),
+  body TEXT NOT NULL,
+  score_int INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS comments_deal_created_idx ON comments(deal_id, created_at DESC);
+
+CREATE TYPE vote_target AS ENUM ('DEAL','COMMENT');
+CREATE TABLE IF NOT EXISTS votes(
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  target_type vote_target NOT NULL,
+  target_id BIGINT NOT NULL,
+  value SMALLINT NOT NULL CHECK (value IN (-1,1)),
+  UNIQUE(user_id, target_type, target_id)
+);
+
+CREATE TABLE IF NOT EXISTS flags(
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  target_type vote_target NOT NULL,
+  target_id BIGINT NOT NULL,
+  reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+---
+
+───────────────────────────────────────────────────────────────────────────────
+5) IMPLEMENTATION STEPS (BACKEND)
+───────────────────────────────────────────────────────────────────────────────
+1. Bootstrap Spring Boot project (Initializer or existing template).
+2. Add entities + repositories (Users, Deals, Comments, Votes, Stores, Categories).
+3. Add DTOs & mappers (record-based DTOs in Java 21).
+4. Auth:
+   - Register: email + password → hash with BCrypt → insert
+   - Login: verify password → issue JWT (HS256) with userId & roles
+   - Filter: JWT auth filter for /api/**, permit /api/auth/**
+5. Deals API:
+   - POST /api/deals (auth) — create
+   - GET /api/deals?sort=hot|new&category=&store=&q= — paginate
+   - GET /api/deals/{id} — detail (with comments count & score)
+   - PATCH /api/deals/{id} (owner/admin) — edit
+   - DELETE /api/deals/{id} (owner/admin) — delete
+6. Voting:
+   - POST /api/deals/{id}/vote {value:1|-1}
+   - POST /api/comments/{id}/vote {value:1|-1}
+   - Denormalize score_int through SQL update in a transaction.
+7. Comments API:
+   - POST /api/deals/{id}/comments
+   - GET /api/deals/{id}/comments (flat or nested build in service)
+8. Moderation:
+   - POST /api/flags {targetType, targetId, reason}
+   - GET /api/admin/flags (ADMIN role only)
+9. Search:
+   - Use ILIKE on title/description or pg_trgm similarity for MVP; later Elastic.
+10. Validate & sanitize inputs; enforce rate limit (Spring Bucket4j optional).
+
+───────────────────────────────────────────────────────────────────────────────
+6) TESTING STEPS
+───────────────────────────────────────────────────────────────────────────────
+Unit Tests:
+  - Services: hashing, JWT, score updates, validations.
+  - Repositories: simple CRUD & query methods.
+Integration Tests (Testcontainers):
+  - Spin Postgres container per test class.
+  - Migrations with Flyway run automatically.
+  - REST Assured: auth flow, deals CRUD, votes, comments.
+Contract/Smoke:
+  - Postman collection (/docs/DealHive-API.postman_collection.json) with Newman in CI.
+Performance (local, optional):
+  - Gatling/Locust baseline: list hot deals (100 rps), create deal (20 rps).
+
+Example JUnit skeleton:
+---
+@SpringBootTest
+@Testcontainers
+class DealApiIT {
+  @Container
+  static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:16");
+  @DynamicPropertySource
+  static void props(DynamicPropertyRegistry r) {
+    r.add("spring.datasource.url", pg::getJdbcUrl);
+    r.add("spring.datasource.username", pg::getUsername);
+    r.add("spring.datasource.password", pg::getPassword);
+  }
+  @Test void createAndFetchDeal() { /* ... */ }
+}
+---
+
+───────────────────────────────────────────────────────────────────────────────
+7) INTEGRATION & CI/CD
+───────────────────────────────────────────────────────────────────────────────
+Environment variables (dev):
+  DB_URL=jdbc:postgresql://localhost:5432/dealhive
+  DB_USERNAME=dealhive
+  DB_PASSWORD=dealhive
+  JWT_SECRET=replace_in_prod
+
+GitHub Actions (sample):
+  - jobs:
+    - build-test: mvn -B -DskipITs=false test (with services: postgres:16)
+    - package: mvn -B -DskipTests package
+    - docker: build app image, push to ECR/Docker Hub
+    - deploy: AWS ECS/EKS or EC2 with docker-compose
+
+Postman/Newman step:
+  newman run docs/DealHive-API.postman_collection.json --env-var baseUrl=http://localhost:8080
+
+Database migrations:
+  - Use Flyway for all schema changes (V2__..., V3__...)
+  - Never manual DDL in prod; PR-reviewed migrations only.
+
+Observability (MVP):
+  - Logging: JSON logs, include requestId/userId.
+  - Actuator: /actuator/health, /metrics.
+  - Simple request logging filter for latency.
+
+Security notes:
+  - BCrypt strength 10+, JWT TTL ~ 30 days (dev), shorter in prod.
+  - CORS: allow localhost:3000 for web.
+  - Input size limits, file/image handling later via S3 presigned URLs.
+
+───────────────────────────────────────────────────────────────────────────────
+8) QUICKSTART (LOCAL)
+───────────────────────────────────────────────────────────────────────────────
+# 1) Start only DB
+bash ops/start_db.sh
+# 2) Run backend locally
+export DB_URL=jdbc:postgresql://localhost:5432/dealhive
+export DB_USERNAME=dealhive
+export DB_PASSWORD=dealhive
+export JWT_SECRET=dev_secret
+mvn -f backend/pom.xml spring-boot:run
+# 3) Or start full stack with Docker
+docker compose -f ops/docker-compose.yml up -d
+# 4) Stop only DB
+bash ops/stop_db.sh
+# 5) Stop all
+docker compose -f ops/docker-compose.yml down -v
+
+Smoke check:
+  curl -s http://localhost:8080/actuator/health
+  curl -s http://localhost:8080/api/deals
+
+───────────────────────────────────────────────────────────────────────────────
+9) SAMPLE CONTROLLERS (SKETCH)
+───────────────────────────────────────────────────────────────────────────────
+POST /api/auth/register
+  req: {email, password, displayName}
+  res: 201 {id, email, displayName}
+
+POST /api/auth/login
+  req: {email, password}
+  res: 200 {token}
+
+POST /api/deals
+  auth: Bearer
+  req: {title, description, url, imgUrl, priceCents, originalPriceCents, storeId, categoryId, tags[]}
+  res: 201 {id, ...}
+
+GET /api/deals?sort=hot|new&q=&storeId=&categoryId=&page=&size=
+  res: 200 {content:[{id,title,scoreInt,...}], page, size, total}
+
+POST /api/deals/{id}/vote  {value:1|-1}
+POST /api/deals/{id}/comments {body, parentId?}
+POST /api/comments/{id}/vote  {value:1|-1}
+POST /api/flags {targetType, targetId, reason}
+
+───────────────────────────────────────────────────────────────────────────────
+10) DEVELOPER NOTES FOR CLAUDE CODE
+───────────────────────────────────────────────────────────────────────────────
+- Respect this repo layout and file names when generating code.
+- Prefer records and Lombok-less style (explicit getters) to keep it plain.
+- Validate inputs (Jakarta @Valid) and return Problem+JSON for errors.
+- Keep endpoints idempotent where relevant and transactional where needed.
+- Add pagination defaults: page=0, size=20; max size=100.
+- Put constants (roles, enums) in shared package com.dealhive.common.
+- Keep SQL portability; avoid vendor-specific until needed (pg_trgm already gated by extension).
+
+END OF FILE.
